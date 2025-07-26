@@ -1,34 +1,41 @@
 #!/bin/bash
 
-# Optional: echo for visibility
+DEFAULT_LENGTH=60
+DEFAULT_RESOLUTION=1080
+DEFAULT_CRF=28
+DEFAULT_TIMEOUT=30
+DEFAULT_INTERVAL=21600
+
+LENGTH_VAL="${LENGTH:-$DEFAULT_LENGTH}"
+RESOLUTION_VAL="${RESOLUTION:-$DEFAULT_RESOLUTION}"
+CRF_VAL="${CRF:-$DEFAULT_CRF}"
+TIMEOUT_VAL="${TIMEOUT:-$DEFAULT_TIMEOUT}"
+INTERVAL_VAL="${INTERVAL:-$DEFAULT_INTERVAL}"
+
 echo "Launching backdrop generator with:"
-echo "  --length $LENGTH"
-echo "  --resolution $RESOLUTION"
-echo "  --crf $CRF"
-echo "  --timeout $TIMEOUT"
-echo "  --interval $INTERVAL"
+echo "  LENGTH $LENGTH_VAL"
+echo "  RESOLUTION $RESOLUTION_VAL"
+echo "  CRF $CRF_VAL"
+echo "  TIMEOUT $TIMEOUT_VAL"
+echo "  INTERVAL $INTERVAL_VAL"
 echo "  FORCE=$FORCE"
 echo "  DAEMON=$DAEMON"
 echo "  NO_AUDIO=$NO_AUDIO"
 echo "  FFMPEG_EXTRA=$FFMPEG_EXTRA"
 
-# Build args
 args=(
   --movies /movies
   --tv /tv
-  --length "${LENGTH:-5}"
-  --resolution "${RESOLUTION:-720}"
-  --crf "${CRF:-28}"
-  --timeout "${TIMEOUT:-30}"
-  --interval "${INTERVAL:-21600}"
+  --length "$LENGTH_VAL"
+  --resolution "$RESOLUTION_VAL"
+  --crf "$CRF_VAL"
+  --timeout "$TIMEOUT_VAL"
+  --interval "$INTERVAL_VAL"
 )
 
-# Conditionally add flags
 [ "$FORCE" = "true" ] && args+=(--force)
 [ "$DAEMON" = "true" ] && args+=(--daemon)
 [ "$NO_AUDIO" = "true" ] && args+=(--no-audio)
-
-# Add custom FFmpeg parameters if provided
 [ -n "$FFMPEG_EXTRA" ] && args+=(--ffmpeg-extra "$FFMPEG_EXTRA")
 
 exec python media_theme_processor.py "${args[@]}"
