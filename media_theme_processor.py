@@ -5,7 +5,7 @@ Generate short backdrop clips for Emby/Jellyfin libraries.
 Features
 ========
 * Adjustable **clip length** (`--length`, default 5 s).
-* Selectable **resolution** 720 p or 1080 p (`--resolution`, default 720).
+* Selectable **resolution** 720p, 1080p, 1440p, or 2160p (`--resolution`, default 720p).
   The filter only downsizes → no up‑scaling of small sources.
 * Tunable **compression** via CRF (`--crf`, default 28) and preset
   (`--preset`, default *veryfast*).
@@ -77,7 +77,7 @@ class MediaBackdropProcessor:
         self.tv_path = Path(tv_path)
         self.timeout = timeout
         self.clip_len = clip_len
-        self.resolution = resolution  # 720 or 1080
+        self.resolution = resolution
         self.crf = crf
         self.preset = preset
         self.delay = delay
@@ -85,7 +85,12 @@ class MediaBackdropProcessor:
         self.include_audio = include_audio
         self.ffmpeg_extra = ffmpeg_extra
 
-        self.width, self.height = (1280, 720) if resolution == 720 else (1920, 1080)
+        self.width, self.height = {
+            720: (1280, 720),
+            1080: (1920, 1080),
+            1440: (2560, 1440),
+            2160: (3840, 2160),
+        }.get(resolution, (1280, 720))
 
     @staticmethod
     def _touch_placeholder(target: Path) -> None:
@@ -113,9 +118,32 @@ class MediaBackdropProcessor:
             logger.warning("Duration error for %s: %s", video, exc)
             return 0.0
 
+    @staticmethod
+    def _video_dimensions(video: Path) -> tuple[int, int]:
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "v:0",
+                str(video),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            streams = json.loads(result.stdout)["streams"]
+            if streams:
+                return int(streams[0]["width"]), int(streams[0]["height"])
+            return 0, 0
+        except Exception as exc:
+            logger.warning("Dimensions error for %s: %s", video, exc)
+            return 0, 0
+
     def _extract_clip(self, src: Path, dst: Path) -> bool:
         total = self._video_duration(src)
-        if total < 60:
+        if total < self.clip_len * 1.6:
             logger.info("Video too short: %s", src)
             return False
 
@@ -124,13 +152,35 @@ class MediaBackdropProcessor:
             logger.info("Insufficient safe range in %s", src)
             return False
 
+        # Get input video dimensions and adjust output resolution to avoid upscaling
+        input_width, input_height = self._video_dimensions(src)
+        if input_width > 0 and input_height > 0:
+            # Use the smaller of target resolution or input resolution to avoid upscaling
+            output_width = min(self.width, input_width)
+            output_height = min(self.height, input_height)
+            
+            # Maintain aspect ratio - scale down proportionally if needed
+            input_aspect = input_width / input_height
+            target_aspect = output_width / output_height
+            
+            if input_aspect > target_aspect:
+                # Input is wider, fit to width
+                output_height = int(output_width / input_aspect)
+            else:
+                # Input is taller, fit to height  
+                output_width = int(output_height * input_aspect)
+                
+            logger.debug("Input: %dx%d, Target: %dx%d, Output: %dx%d", 
+                        input_width, input_height, self.width, self.height, output_width, output_height)
+        else:
+            # Fallback to target resolution if we can't detect input dimensions
+            output_width, output_height = self.width, self.height
+
         start = random.uniform(start_safe, end_safe - self.clip_len)
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-        scale_pad = (
-            f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
-            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2"
-        )
+        # Use simple scale filter without padding to avoid black borders
+        scale_filter = f"scale={output_width}:{output_height}"
 
         ff_cmd = [
             "ffmpeg",
@@ -144,7 +194,7 @@ class MediaBackdropProcessor:
             "-c:v",
             "libx264",
             "-vf",
-            scale_pad,
+            scale_filter,
             "-preset",
             self.preset,
             "-crf",
@@ -210,8 +260,18 @@ class MediaBackdropProcessor:
         label = "TV" if is_tv else "Movie"
         logger.info("Processing %s: %s", label, folder.name)
 
-        dst = folder / "backdrops" / "backdrop.mp4"
-        placeholder = dst.with_suffix(dst.suffix + PLACEHOLDER_SUFFIX)
+        backdrops_dir = folder / "backdrops"
+        video_num = 1
+        while True:
+            dst = backdrops_dir / f"video{video_num}.mp4"
+            placeholder = dst.with_suffix(dst.suffix + PLACEHOLDER_SUFFIX)
+            if not dst.exists() and not placeholder.exists():
+                break
+            video_num += 1
+        
+        if self.force:
+            dst = backdrops_dir / "video1.mp4"
+            placeholder = dst.with_suffix(dst.suffix + PLACEHOLDER_SUFFIX)
 
         if not self.force and (dst.exists() or placeholder.exists()):
             logger.debug("Backdrop already present for %s", folder.name)
@@ -273,7 +333,7 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--interval", type=int, default=3600, help="Seconds between scans when --daemon is set")
 
     p.add_argument("--length", type=int, default=5, help="Clip length in seconds (default 5)")
-    p.add_argument("--resolution", type=int, choices=[720, 1080], default=720, help="Output resolution (default 720)")
+    p.add_argument("--resolution", type=int, choices=[720, 1080, 1440, 2160], default=720, help="Output resolution (default 720)")
     p.add_argument("--crf", type=int, default=28, help="x264 CRF value (default 28 → smaller file)")
     p.add_argument("--preset", default="veryfast", help="x264 preset (default 'veryfast')")
 
