@@ -141,17 +141,49 @@ class MediaBackdropProcessor:
             logger.warning("Dimensions error for %s: %s", video, exc)
             return 0, 0
 
-    def _extract_clip(self, src: Path, dst: Path) -> bool:
+    def _extract_clip(self, src: Path, dst: Path, video_index: int = 1) -> bool:
         total = self._video_duration(src)
-        if total < self.clip_len * 1.6:
-            logger.info("Video too short: %s", src)
+        #if total < self.clip_len * 1.6:
+        #    logger.info("Video too short: %s", src)
+        #    return False
+    
+        # Dynamic safe ranges based on video index (1-5, cycling back to 1 after 5)
+        index = ((video_index - 1) % 5) + 1  # Ensure we cycle through 1-5
+        
+        # Define 5 segments across the video duration
+        # Skip first 5% and last 15% to avoid credits/intro issues
+        usable_duration = total * 0.8  # Use 80% of video (skip 5% start, 15% end)
+        segment_size = usable_duration / 5
+        start_offset = total * 0.05  # 5% into the video
+        
+        # Calculate segment boundaries
+        segment_start = start_offset + (index - 1) * segment_size
+        segment_end = start_offset + index * segment_size
+        
+        # Ensure we have enough room for the clip within this segment
+        if segment_end - segment_start < self.clip_len:
+            logger.info("Segment too small for clip in %s (index %d)", src, video_index)
             return False
-
-        start_safe, end_safe = total * 0.1, total * 0.5
-        if end_safe - start_safe < self.clip_len:
-            logger.info("Insufficient safe range in %s", src)
-            return False
-
+        
+        # Calculate the safe range within this segment (leaving room for the clip)
+        start_safe = segment_start
+        end_safe = segment_end - self.clip_len
+        
+        # If the segment is still too small after accounting for clip length, use fallback
+        if end_safe <= start_safe:
+            # Fallback to original safe range if segment is too small
+            start_safe, end_safe = total * 0.1, total * 0.5
+            if end_safe - start_safe < self.clip_len:
+                logger.info("Insufficient safe range in %s", src)
+                return False
+            logger.debug("Using fallback range for %s (index %d)", src.name, video_index)
+        else:
+            logger.debug("Using segment %d (%.1f%%-%.1f%%) for %s", 
+                        index, 
+                        (segment_start/total)*100, 
+                        (segment_end/total)*100, 
+                        src.name)
+    
         # Get input video dimensions and adjust output resolution to avoid upscaling
         input_width, input_height = self._video_dimensions(src)
         if input_width > 0 and input_height > 0:
@@ -175,13 +207,13 @@ class MediaBackdropProcessor:
         else:
             # Fallback to target resolution if we can't detect input dimensions
             output_width, output_height = self.width, self.height
-
-        start = random.uniform(start_safe, end_safe - self.clip_len)
+    
+        start = random.uniform(start_safe, end_safe)
         dst.parent.mkdir(parents=True, exist_ok=True)
-
+    
         # Use simple scale filter without padding to avoid black borders
         scale_filter = f"scale={output_width}:{output_height}"
-
+    
         ff_cmd = [
             "ffmpeg",
             "-y",
@@ -202,13 +234,13 @@ class MediaBackdropProcessor:
             "-avoid_negative_ts",
             "make_zero",
         ]
-
+    
         # Handle audio options
         if self.include_audio:
             ff_cmd.extend(["-c:a", "aac"])
         else:
             ff_cmd.extend(["-an"])  # Remove audio stream
-
+    
         # Add custom FFmpeg parameters if provided
         if self.ffmpeg_extra:
             try:
@@ -218,13 +250,14 @@ class MediaBackdropProcessor:
                 logger.debug("Added custom FFmpeg parameters: %s", extra_params)
             except ValueError as exc:
                 logger.warning("Could not parse custom FFmpeg parameters '%s': %s", self.ffmpeg_extra, exc)
-
+    
         # Add output file at the end
         ff_cmd.append(str(dst))
-
+    
         try:
             subprocess.run(ff_cmd, capture_output=True, text=True, timeout=self.timeout, check=True)
-            logger.info("Backdrop created: %s", dst)
+            logger.info("Backdrop created: %s (from segment %d, %.1f%%-%.1f%%, start=%.1fs)", 
+                       dst, index, (segment_start/total)*100, (segment_end/total)*100, start)
             return True
         except subprocess.TimeoutExpired:
             logger.error("FFmpeg timed out (%ss) for %s", self.timeout, src)
@@ -232,10 +265,107 @@ class MediaBackdropProcessor:
             logger.error("FFmpeg error for %s: %s", src, exc.stderr or exc)
         except Exception as exc:
             logger.error("Unexpected error for %s: %s", src, exc)
-
+    
         self._touch_placeholder(dst)
         return False
 
+    def _generate_backdrop_image(self, folder: Path, video_path: Path) -> None:
+        """Generate a backdrop image from the created video clip."""
+        # Check for existing backdrop images
+        backdrop_extensions = [".jpg", ".jpeg", ".png"]
+        existing_backdrops = []
+        
+        for ext in backdrop_extensions:
+            backdrop_path = folder / f"backdrop{ext}"
+            if backdrop_path.exists():
+                existing_backdrops.append(backdrop_path)
+        
+        # Skip if backdrop already exists and not in force mode
+        if existing_backdrops: # and not self.force:
+            logger.debug("Backdrop image already exists for %s", folder.name)
+            return
+        
+        if self.force:
+            for backdrop in existing_backdrops:
+                # TODO Extra flag to remove existing backdrops
+                # backdrop.unlink(missing_ok=True)
+                logger.debug("Removed existing backdrop: %s", backdrop)
+        
+        backdrop_dst = folder / "backdrop.jpg"
+        
+        # Extract multiple frames and pick the best one
+        # Use 3 different time points to increase chances of getting a good frame
+        frame_times = [
+            min(2.0, self.clip_len * 0.3),   # 30% into clip or 2 seconds
+            min(3.0, self.clip_len * 0.5),   # 50% into clip or 3 seconds  
+            min(4.0, self.clip_len * 0.7),   # 70% into clip or 4 seconds
+        ]
+        
+        # Try each frame time and use the first successful extraction
+        for i, frame_time in enumerate(frame_times):
+            temp_output = backdrop_dst.with_suffix(f".temp{i}.jpg")
+            
+            ff_cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(frame_time),
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-vf", "select=eq(pict_type\\,I)",  # Prefer I-frames (keyframes) for better quality
+                "-q:v", "1",  # Highest quality JPEG (was 2)
+                "-pix_fmt", "yuvj420p",  # Better color space for JPEG
+                str(temp_output)
+            ]
+            
+            try:
+                subprocess.run(ff_cmd, capture_output=True, text=True, timeout=30, check=True)
+                # If successful, move temp file to final location and clean up
+                temp_output.rename(backdrop_dst)
+                logger.info("Backdrop image created: %s (from frame at %.1fs)", backdrop_dst, frame_time)
+                
+                # Clean up any remaining temp files
+                for j in range(len(frame_times)):
+                    temp_file = backdrop_dst.with_suffix(f".temp{j}.jpg")
+                    temp_file.unlink(missing_ok=True)
+                return
+                
+            except subprocess.CalledProcessError as exc:
+                logger.debug("Frame extraction failed at %.1fs for %s: %s", frame_time, folder.name, exc.stderr or exc)
+                temp_output.unlink(missing_ok=True)  # Clean up failed temp file
+                continue
+            except subprocess.TimeoutExpired:
+                logger.debug("Frame extraction timed out at %.1fs for %s", frame_time, folder.name)
+                temp_output.unlink(missing_ok=True)
+                continue
+            except Exception as exc:
+                logger.debug("Unexpected error extracting frame at %.1fs for %s: %s", frame_time, folder.name, exc)
+                temp_output.unlink(missing_ok=True)
+                continue
+        
+        # If all frame extractions failed, fall back to simple extraction
+        logger.warning("All I-frame extractions failed for %s, trying simple extraction", folder.name)
+        
+        ff_cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", str(frame_times[1]),  # Use middle time point
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", "1",  # Highest quality
+            "-pix_fmt", "yuvj420p",
+            str(backdrop_dst)
+        ]
+        
+        try:
+            subprocess.run(ff_cmd, capture_output=True, text=True, timeout=30, check=True)
+            logger.info("Backdrop image created (fallback): %s", backdrop_dst)
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg timed out while creating backdrop image for %s", folder.name)
+        except subprocess.CalledProcessError as exc:
+            logger.error("FFmpeg error creating backdrop image for %s: %s", folder.name, exc.stderr or exc)
+        except Exception as exc:
+            logger.error("Unexpected error creating backdrop image for %s: %s", folder.name, exc)
+    
     @staticmethod
     def _find_videos(folder: Path) -> List[Path]:
         return sorted(p for p in folder.rglob("*") if p.suffix.lower() in VIDEO_EXTS)
@@ -272,7 +402,8 @@ class MediaBackdropProcessor:
         if self.force:
             dst = backdrops_dir / "video1.mp4"
             placeholder = dst.with_suffix(dst.suffix + PLACEHOLDER_SUFFIX)
-
+            
+        # Check for existing will fail if force=false due to automated video number increase. Add new parameter to skip if video_num 1 exists?
         if not self.force and (dst.exists() or placeholder.exists()):
             logger.debug("Backdrop already present for %s", folder.name)
             return
@@ -295,7 +426,10 @@ class MediaBackdropProcessor:
             self._touch_placeholder(dst)
             return
 
-        self._extract_clip(src, dst)
+        video_created = self._extract_clip(src, dst, video_num)
+        
+        if video_created:
+            self._generate_backdrop_image(folder, dst)
 
         if self.delay:
             time.sleep(self.delay)
