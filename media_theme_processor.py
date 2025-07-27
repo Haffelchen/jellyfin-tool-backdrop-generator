@@ -269,6 +269,7 @@ class MediaBackdropProcessor:
         self._touch_placeholder(dst)
         return False
 
+    # TODO Use video index to create multiple backdrop images
     def _generate_backdrop_image(self, folder: Path, video_path: Path) -> None:
         """Generate a backdrop image from the created video clip."""
         # Check for existing backdrop images
